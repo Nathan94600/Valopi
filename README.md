@@ -23,12 +23,12 @@ import Valopi from ".";
 const valopi = new Valopi("Your RIOT_TOKEN")
 
 valopi.getStatus("EU").then(platformData => {
-	if (typeof platformData == "string") console.log(`Platform data: ${platformData}`);
-	else {
-		console.log(`Platform name: ${platformData.name}`)
-		console.log(`Platform maintenances: ${platformData.maintenances.length}`)
-		console.log(`Platform incidents: ${platformData.incidents.length}`)
-	}
+  if (typeof platformData == "string") console.log(`Platform data: ${platformData}`);
+  else {
+    console.log(`Platform name: ${platformData.name}`)
+    console.log(`Platform maintenances: ${platformData.maintenances.length}`)
+    console.log(`Platform incidents: ${platformData.incidents.length}`)
+  }
 })
 ```
 
@@ -40,12 +40,12 @@ import Valopi, { ConsoleQueues } from ".";
 const valopi = new Valopi("Your RIOT_TOKEN");
 
 valopi.getConsoleRecentMatches(ConsoleQueues.Unrated, "EU").then(recentMatches => {
-	if (typeof recentMatches == "string") console.log(`Recent matches: ${recentMatches}`);
-	else {
-		console.log("Match ids :");
+  if (typeof recentMatches == "string") console.log(`Recent matches: ${recentMatches}`);
+  else {
+    console.log("Match ids :");
 
-		recentMatches.matchIds.forEach(matchId => console.log(`- ${matchId}`));
-	};
+    recentMatches.matchIds.forEach(matchId => console.log(`- ${matchId}`));
+  };
 });
 ```
 
@@ -57,11 +57,11 @@ import Valopi from ".";
 const valopi = new Valopi("Your RIOT_TOKEN");
 
 valopi.getLeaderboard("ACT_ID", { size: 100 }, "EU").then(leaderboard => {
-	if (typeof leaderboard == "string") console.log(`Leaderboard: ${leaderboard}`);
-	else {
-		console.log("Player names :");
+  if (typeof leaderboard == "string") console.log(`Leaderboard: ${leaderboard}`);
+  else {
+    console.log("Player names :");
 
-		leaderboard.players.forEach(player => console.log(`- ${player.gameName || "Anonymous"}`));
-	};
+    leaderboard.players.forEach(player => console.log(`- ${player.gameName || "Anonymous"}`));
+  };
 });
 ```

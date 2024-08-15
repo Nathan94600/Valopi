@@ -5,7 +5,7 @@
 
 ## About
 
-Valopi is a [Node.js](https://nodejs.org/en) module for interacting with [Valorant API](https://developer.riotgames.com).
+Valopi is a [Node.js](https://nodejs.org/en) module for interacting with [Valorant API](https://developer.riotgames.com). The module handles rate limits and includes a caching system.
 
 ## Example usage
 

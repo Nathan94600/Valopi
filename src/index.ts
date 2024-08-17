@@ -1,11 +1,12 @@
 // Constants
 
-const BASE_URL = ".api.riotgames.com/val/"
+const BASE_URL = ".api.riotgames.com/val/", TTL = 300000 /* 5 minutes */
 
 // Functions
 
-function updateRateLimit(rateLimit: RateLimits[Region], funcName: FunctionName, headers: Headers) {
-	const [firstAppRateLimit, firstAppRateLimitTime, secondAppRateLimit, secondAppRateLimitTime] = headers.get("x-app-rate-limit")?.split("").flatMap(v => v.split("")) || [],
+function updateRateLimit<RL extends RateLimits[Region | ConsoleRegion]>(rateLimit: RL, funcName: Exclude<keyof RL, "app">, headers: Headers) {
+	const funcRateLimit: any = rateLimit[funcName],
+	[firstAppRateLimit, firstAppRateLimitTime, secondAppRateLimit, secondAppRateLimitTime] = headers.get("x-app-rate-limit")?.split("").flatMap(v => v.split("")) || [],
 	[firstAppRateCount, firstAppRateCountTime, secondAppRateCount, secondAppRateCountTime] = headers.get("x-app-rate-count")?.split("").flatMap(v => v.split("")) || [],
 	[methodRateLimit, methodRateLimitTime] = headers.get("x-method-rate-limit")?.split("") || [],
 	[methodRateCount, methodRateCountTime] = headers.get("x-method-rate-limit-count")?.split("") || [],
@@ -15,11 +16,11 @@ function updateRateLimit(rateLimit: RateLimits[Region], funcName: FunctionName, 
 
 	if (firstAppRateCount) rateLimit.app[0].count = parseInt(firstAppRateCount);
 	if (secondAppRateCount) rateLimit.app[1].count = parseInt(secondAppRateCount);
-	if (methodRateCount) rateLimit[funcName].count = parseInt(methodRateCount);
+	if (methodRateCount) funcRateLimit.count = parseInt(methodRateCount);
 
 	if (firstAppRateLimit) rateLimit.app[0].max = parseInt(firstAppRateLimit);
 	if (secondAppRateLimit) rateLimit.app[1].max = parseInt(secondAppRateLimit);
-	if (methodRateLimit) rateLimit[funcName].max = parseInt(methodRateLimit);
+	if (methodRateLimit) funcRateLimit.max = parseInt(methodRateLimit);
 
 	if (!rateLimit.app[0].timeout && firstAppTime) rateLimit.app[0].timeout = setTimeout(() => {
 		rateLimit.app[0].count = 0;
@@ -29,23 +30,28 @@ function updateRateLimit(rateLimit: RateLimits[Region], funcName: FunctionName, 
 		rateLimit.app[1].count = 0;
 		rateLimit.app[1].timeout = null;
 	}, parseInt(secondAppTime) * 1000)
-	if (!rateLimit[funcName].timeout && methodTime) rateLimit[funcName].timeout = setTimeout(() => {
-		rateLimit[funcName].count = 0;
-		rateLimit[funcName].timeout = null;
+	if (!funcRateLimit.timeout && methodTime) funcRateLimit.timeout = setTimeout(() => {
+		funcRateLimit.count = 0;
+		funcRateLimit.timeout = null;
 	}, parseInt(methodTime) * 1000)
 }
+
+function isConsolRegion(region: string): region is ConsoleRegion { return region.includes("Console") }
+function isConsoleQueue(queue: string): queue is ConsoleQueues { return queue.startsWith("console") }
+function isPlatformType(platform: string): platform is PlatformTypes { return platform == "playstation" || platform == "xbox" }
 
 /**
  * @param riotToken See https://developer.riotgames.com/
  */
-function getMatch(cache: Cache, rateLimits: RateLimits, matchId: string, region: Region, riotToken: string): Promise<Match | string> {
+
+function getMatch(cache: Cache, rateLimits: RateLimits, matchId: string, region: Region | ConsoleRegion, riotToken: string): Promise<Match | string> {
 	return new Promise((resolve, reject) => {
 		const rateLimit = rateLimits[region], cacheValue = cache.match[region][matchId];
 
-		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + 300000 <= Date.now()) resolve(cacheValue);
+		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + TTL <= Date.now()) resolve(cacheValue);
 		else if (rateLimit.app[0].count >= rateLimit.app[0].max || rateLimit.app[1].count >= rateLimit.app[1].max) reject("App Rate Limit");
 		else if (rateLimit.getMatch.count >= rateLimit.getMatch.max) reject("Method Rate Limit");
-		else fetch(`https://${region.toLowerCase()}${BASE_URL}match/v1/matches/${matchId}`, { method: "GET", headers: { "X-Riot-Token": riotToken } }).then(res => {
+		else fetch(`https://${region.toLowerCase()}${BASE_URL}match${region.includes("Console") ? "/console" : ""}/v1/matches/${matchId}`, { method: "GET", headers: { "X-Riot-Token": riotToken } }).then(res => {
 			const retryAfterHeader = res.headers.get("retry-after");
 
 			updateRateLimit(rateLimit, "getMatch", res.headers);
@@ -53,6 +59,33 @@ function getMatch(cache: Cache, rateLimits: RateLimits, matchId: string, region:
 			if (retryAfterHeader && res.status == 429) setTimeout(async () => resolve(await getMatch(cache, rateLimits, matchId, region, riotToken)), parseInt(retryAfterHeader) * 1000);
 			else res.json().then(json => {
 				if (res.status.toString()[0] == "2") {
+					if (Array.isArray(json) || typeof json !== "object" || typeof json === null) reject({ reason: "Bad response type", value: json });
+					else {
+						const match: Match = {
+							matchInfo: {
+								customGameName: json.matchInfo.customGameName,
+								gameLengthMillis: json.matchInfo.gameLengthMillis,
+								gameMode: json.matchInfo.gameMode,
+								gameStartMillis: json.matchInfo.gameStartMillis,
+								isCompleted: json.matchInfo.isCompleted,
+								isRanked: json.matchInfo.isRanked,
+								mapId: json.matchInfo.mapId,
+								matchId: json.matchInfo.matchId,
+								provisioningFlowId: json.matchInfo.provisioningFlowId,
+								queueId: json.matchInfo.queueId,
+								seasonId: json.matchInfo.seasonId,
+							},
+							coaches: json.coaches.map((coach: ApiCoach) => new Coach(coach, cache, rateLimits, riotToken)),
+							players: json.players.map((player: ApiMatchPlayer) => new MatchPlayer(player, cache, rateLimits, riotToken)),
+							roundResults: json.roundResults.map((roundResult: ApiRoundResult) => new RoundResult(roundResult, cache, rateLimits, riotToken)),
+							teams: json.teams.map((team: ApiTeam) => team.teamId == "Red" || team.teamId == "Blue" ? new DeathmatchTeam(team) : new NonDeathmatchTeam(team, cache, rateLimits, riotToken)),
+						};
+	
+						cache.match[region][matchId] = { ...match, lastUpdate: Date.now() };
+	
+						resolve(match);
+					}
+
 					cache.match[region][matchId] = { ...json, lastUpdate: Date.now() };
 
 					resolve(json);
@@ -63,33 +96,6 @@ function getMatch(cache: Cache, rateLimits: RateLimits, matchId: string, region:
 }
 
 /**
- * @param riotToken See https://developer.riotgames.com/
- */
-function getConsoleMatch(cache: Cache, rateLimits: RateLimits, matchId: string, region: ConsoleRegion, platform: PlatformTypes, riotToken: string): Promise<Match | string> {
-	return new Promise((resolve, reject) => {
-		const rateLimit = rateLimits[region], cacheValue = cache.consoleMatch[region][platform][matchId];
-
-		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + 300000 <= Date.now()) resolve(cacheValue);
-		else if (rateLimit.app[0].count >= rateLimit.app[0].max || rateLimit.app[1].count >= rateLimit.app[1].max) reject("App Rate Limit");
-		else if (rateLimit.getConsoleMatch.count >= rateLimit.getConsoleMatch.max) reject("Method Rate Limit");
-		else fetch(`https://${region.toLowerCase()}${BASE_URL}match/v1/matches/${matchId}`, { method: "GET", headers: { "X-Riot-Token": riotToken } }).then(res => {
-			const retryAfterHeader = res.headers.get("retry-after");
-
-			updateRateLimit(rateLimit, "getConsoleMatch", res.headers);
-
-			if (retryAfterHeader && res.status == 429) setTimeout(async () => resolve(await getConsoleMatch(cache, rateLimits, matchId, region, platform, riotToken)), parseInt(retryAfterHeader) * 1000);
-			else res.json().then(json => {
-				if (res.status.toString()[0] == "2") {
-					cache.consoleMatch[region][platform][matchId] = { ...json, lastUpdate: Date.now() };
-
-					resolve(json);
-				} else reject(json);
-			}, () => res.text().then(text => (res.status.toString()[0] == "2" ? resolve : reject)(text)))
-		}, reason => resolve(reason))
-	})
-}
-
-/**
  * Get recent matches
  * 
  * Returns a list of match ids that have completed in the last 10 minutes for live regions and 12 hours for the esports routing value.
@@ -98,57 +104,35 @@ function getConsoleMatch(cache: Cache, rateLimits: RateLimits, matchId: string, 
  * Requests are load balanced so you may see some inconsistencies as matches are added/removed from the list.
  * @param riotToken See https://developer.riotgames.com/
  */
-function getRecentMatches(cache: Cache, rateLimits: RateLimits, queue: Queues, region: Region, riotToken: string): Promise<RecentMatches | string> {
+function getRecentMatches(cache: Cache, rateLimits: RateLimits, queue: Queues, region: Region, riotToken: string): Promise<RecentMatches | string>
+function getRecentMatches(cache: Cache, rateLimits: RateLimits, queue: ConsoleQueues, region: ConsoleRegion, riotToken: string): Promise<RecentMatches | string>
+function getRecentMatches(cache: Cache, rateLimits: RateLimits, queue: Queues | ConsoleQueues, region: Region | ConsoleRegion, riotToken: string): Promise<RecentMatches | string> {
 	return new Promise((resolve, reject) => {
-		const rateLimit = rateLimits[region], console = queue.startsWith("console"), cacheValue = cache.recentMatches[region][queue];
+		const rateLimit = rateLimits[region], cacheValue = cache.recentMatches[region][queue];
 
-		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + 300000 <= Date.now()) resolve(cacheValue);
+		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + TTL <= Date.now()) resolve(cacheValue);
 		else if (rateLimit.app[0].count >= rateLimit.app[0].max || rateLimit.app[1].count >= rateLimit.app[1].max) reject("App Rate Limit");
 		else if (rateLimit.getRecentMatches.count >= rateLimit.getRecentMatches.max) reject("Method Rate Limit");
-		else fetch(`https://${region.toLowerCase()}${BASE_URL}match${console ? "/console" : ""}/v1/recent-matches/by-queue/${queue}`, { method: "GET", headers: { "X-Riot-Token": riotToken } }).then(res => {
+		else fetch(`https://${region.toLowerCase()}${BASE_URL}match${isConsoleQueue(queue) ? "/console" : ""}/v1/recent-matches/by-queue/${queue}`, { method: "GET", headers: { "X-Riot-Token": riotToken } }).then(res => {
 			const retryAfterHeader = res.headers.get("retry-after");
 
 			updateRateLimit(rateLimit, "getRecentMatches", res.headers);
 
-			if (retryAfterHeader && res.status == 429) setTimeout(async () => resolve(await getRecentMatches(cache, rateLimits, queue, region, riotToken)), parseInt(retryAfterHeader) * 1000);
+			if (retryAfterHeader && res.status == 429) setTimeout(async () => {
+				if (isConsoleQueue(queue) && isConsolRegion(region)) resolve(await getRecentMatches(cache, rateLimits, queue, region, riotToken));
+				else if (!isConsoleQueue(queue) && !isConsolRegion(region)) resolve(await getRecentMatches(cache, rateLimits, queue, region, riotToken)); 
+				else reject("Queue and region incompatible");
+			}, parseInt(retryAfterHeader) * 1000);
 			else res.json().then(json => {
 				if (res.status.toString()[0] == "2") {
-					cache.recentMatches[region][queue] = { ...json, lastUpdate: Date.now() };
-
-					resolve(json);
-				} reject(json);
-			}, () => res.text().then(text => (res.status.toString()[0] == "2" ? resolve : reject)(text)))
-		}, reason => resolve(reason))
-	})
-}
-
-/**
- * Get recent matches
- * 
- * Returns a list of match ids that have completed in the last 10 minutes for live regions and 12 hours for the esports routing value.
- * NA/LATAM/BR share a match history deployment.
- * As such, recent matches will return a combined list of matches from those three regions.
- * Requests are load balanced so you may see some inconsistencies as matches are added/removed from the list.
- * @param riotToken See https://developer.riotgames.com/
- */
-function getConsoleRecentMatches(cache: Cache, rateLimits: RateLimits, queue: ConsoleQueues, region: ConsoleRegion, riotToken: string): Promise<RecentMatches | string> {
-	return new Promise((resolve, reject) => {
-		const rateLimit = rateLimits[region], console = queue.startsWith("console"), cacheValue = cache.consoleRecentMatches[region][queue];
-
-		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + 300000 <= Date.now()) resolve(cacheValue);
-		else if (rateLimit.app[0].count >= rateLimit.app[0].max || rateLimit.app[1].count >= rateLimit.app[1].max) reject("App Rate Limit");
-		else if (rateLimit.getConsoleRecentMatches.count >= rateLimit.getConsoleRecentMatches.max) reject("Method Rate Limit");
-		else fetch(`https://${region.toLowerCase()}${BASE_URL}match${console ? "/console" : ""}/v1/recent-matches/by-queue/${queue}`, { method: "GET", headers: { "X-Riot-Token": riotToken } }).then(res => {
-			const retryAfterHeader = res.headers.get("retry-after");
-
-			updateRateLimit(rateLimit, "getConsoleRecentMatches", res.headers);
-
-			if (retryAfterHeader && res.status == 429) setTimeout(async () => resolve(await getConsoleRecentMatches(cache, rateLimits, queue, region, riotToken)), parseInt(retryAfterHeader) * 1000);
-			else res.json().then(json => {
-				if (res.status.toString()[0] == "2") {
-					cache.recentMatches[region][queue] = { ...json, lastUpdate: Date.now() };
-
-					resolve(json);
+					if (Array.isArray(json) || typeof json !== "object" || typeof json === null) reject({ reason: "Bad response type", value: json });
+					else {
+						const recentMatches: RecentMatches = { currentTime: json.currentTime, matches: json.matchIds.map((id: string) => new RecentMatch(id, cache, rateLimits, region, riotToken)) };
+	
+						cache.recentMatches[region][queue] = { ...recentMatches, lastUpdate: Date.now() };
+	
+						resolve(recentMatches);
+					}
 				} reject(json);
 			}, () => res.text().then(text => (res.status.toString()[0] == "2" ? resolve : reject)(text)))
 		}, reason => resolve(reason))
@@ -159,52 +143,38 @@ function getConsoleRecentMatches(cache: Cache, rateLimits: RateLimits, queue: Co
  * Get matchlist for games played by puuid 
  * @param riotToken See https://developer.riotgames.com/
  */
-function getPlayerMatches(cache: Cache, rateLimits: RateLimits, puuid: Puuid, region: Region, riotToken: string): Promise<MatchList | string> {
+function getPlayerMatches(cache: Cache, rateLimits: RateLimits, puuid: Puuid, region: Region, riotToken: string): Promise<MatchList | string>
+function getPlayerMatches(cache: Cache, rateLimits: RateLimits, puuid: Puuid, region: ConsoleRegion, platform: PlatformTypes, riotToken: string): Promise<MatchList | string>
+function getPlayerMatches(cache: Cache, rateLimits: RateLimits, puuid: Puuid, region: Region | ConsoleRegion, platform: PlatformTypes | string, riotToken?: string): Promise<MatchList | string> {
 	return new Promise((resolve, reject) => {
-		const rateLimit = rateLimits[region], cacheValue = cache.playerMatches[region][puuid];
+		const rateLimit = rateLimits[region], isPlatform = isPlatformType(platform), cacheValue = cache.playerMatches[region][isPlatform ? platform : "_"][puuid];
 
-		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + 300000 <= Date.now()) resolve(cacheValue);
+		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + TTL <= Date.now()) resolve(cacheValue);
 		else if (rateLimit.app[0].count >= rateLimit.app[0].max || rateLimit.app[1].count >= rateLimit.app[1].max) reject("App Rate Limit");
 		else if (rateLimit.getPlayerMatches.count >= rateLimit.getPlayerMatches.max) reject("Method Rate Limit");
-		else fetch(`https://${region.toLowerCase()}${BASE_URL}match/v1/matchlists/by-puuid/${puuid}`, { method: "GET", headers: { "X-Riot-Token": riotToken } }).then(res => {
+		else fetch(`https://${region.toLowerCase()}${BASE_URL}match${riotToken ? "/console" : ""}/v1/matchlists/by-puuid/${puuid}`, { method: "GET", headers: { "X-Riot-Token": riotToken || platform } }).then(res => {
 			const retryAfterHeader = res.headers.get("retry-after");
 
 			updateRateLimit(rateLimit, "getPlayerMatches", res.headers);
 
-			if (retryAfterHeader && res.status == 429) setTimeout(async () => resolve(await getPlayerMatches(cache, rateLimits, puuid, region, riotToken)), parseInt(retryAfterHeader) * 1000);
+			if (retryAfterHeader && res.status == 429) setTimeout(async () => {
+				if (riotToken && isConsolRegion(region) && isPlatform) resolve(await getPlayerMatches(cache, rateLimits, puuid, region, platform, riotToken));
+				else if (!isConsolRegion(region)) resolve(await getPlayerMatches(cache, rateLimits, puuid, region, platform));
+				else reject("Platform and region incompatible");
+			}, parseInt(retryAfterHeader) * 1000);
 			else res.json().then(json => {
 				if (res.status.toString()[0] == "2") {
-					cache.playerMatches[region][puuid] = { ...json, lastUpdate: Date.now() };
+					if (Array.isArray(json) || typeof json !== "object" || typeof json === null) reject({ reason: "Bad response type", value: json });
+					else {
+						const matchList = {
+							history: json.history.map((entry: ApiMatchListEntry) => new MatchListEntry({ gameStartTimeMillis: entry.gameStartTimeMillis, matchId: entry.matchId, queueId: entry.queueId }, cache, rateLimits, region, riotToken || platform)),
+							puuid: json.puuid
+						};
 
-					resolve(json);
-				} else reject(json);
-			}, () => res.text().then(text => (res.status.toString()[0] == "2" ? resolve : reject)(text)))
-		}, reason => resolve(reason))
-	})
-}
-
-/**
- * Get matchlist for games played by puuid 
- * @param riotToken See https://developer.riotgames.com/
- */
-function getConsolePlayerMatches(cache: Cache, rateLimits: RateLimits, puuid: Puuid, region: ConsoleRegion, platform: PlatformTypes, riotToken: string): Promise<MatchList | string> {
-	return new Promise((resolve, reject) => {
-		const rateLimit = rateLimits[region], cacheValue = cache.consolePlayerMatches[region][platform][puuid];
-
-		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + 300000 <= Date.now()) resolve(cacheValue);
-		else if (rateLimit.app[0].count >= rateLimit.app[0].max || rateLimit.app[1].count >= rateLimit.app[1].max) reject("App Rate Limit");
-		else if (rateLimit.getConsolePlayerMatches.count >= rateLimit.getConsolePlayerMatches.max) reject("Method Rate Limit");
-		else fetch(`https://${region.toLowerCase()}${BASE_URL}match/console/v1/matchlists/by-puuid/${puuid}?platformType=${platform}`, { method: "GET", headers: { "X-Riot-Token": riotToken } }).then(res => {
-			const retryAfterHeader = res.headers.get("retry-after");
-
-			updateRateLimit(rateLimit, "getConsolePlayerMatches", res.headers);
-
-			if (retryAfterHeader && res.status == 429) setTimeout(async () => resolve(await getConsolePlayerMatches(cache, rateLimits, puuid, region, platform, riotToken)), parseInt(retryAfterHeader) * 1000);
-			else res.json().then(json => {
-				if (res.status.toString()[0] == "2") {
-					cache.consolePlayerMatches[region][platform][puuid] = { ...json, lastUpdate: Date.now() };
-
-					resolve(json);
+						cache.playerMatches[region][isPlatform ? platform : "_"][puuid] = { ...matchList, lastUpdate: Date.now() };
+	
+						resolve(matchList);
+					}
 				} else reject(json);
 			}, () => res.text().then(text => (res.status.toString()[0] == "2" ? resolve : reject)(text)))
 		}, reason => resolve(reason))
@@ -216,55 +186,53 @@ function getConsolePlayerMatches(cache: Cache, rateLimits: RateLimits, puuid: Pu
  * @param actId Act ids can be found using the val-content API.
  * @param riotToken See https://developer.riotgames.com/
  */
-function getLeaderboard(cache: Cache, rateLimits: RateLimits, actId: string, region: Exclude<Region, "ESPORTS">, riotToken: string, options: LeaderboardOptions): Promise<Leaderboard | string> {
+function getLeaderboard(cache: Cache, rateLimits: RateLimits, actId: string, region: Exclude<Region, "ESPORTS">, riotToken: string, options: LeaderboardOptions): Promise<Leaderboard | string>
+function getLeaderboard(cache: Cache, rateLimits: RateLimits, actId: string, region: ConsoleRegion, platform: PlatformTypes, riotToken: string, options: LeaderboardOptions): Promise<Leaderboard | string>
+function getLeaderboard(cache: Cache, rateLimits: RateLimits, actId: string, region: Exclude<Region, "ESPORTS"> | ConsoleRegion, platform: PlatformTypes | string, riotToken: string | LeaderboardOptions, options?: LeaderboardOptions): Promise<Leaderboard | string> {
 	return new Promise((resolve, reject) => {
-		const rateLimit = rateLimits[region], cacheValue = cache.leaderboard[region][actId];
+		const rateLimit = rateLimits[region], isPlatform = isPlatformType(platform), cacheValue = cache.leaderboard[region][isPlatform ? platform : "_"][actId], token = typeof riotToken == "string" ? riotToken : platform;
 
-		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + 300000 <= Date.now()) resolve(cacheValue);
+		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + TTL <= Date.now()) resolve(cacheValue);
 		else if (rateLimit.app[0].count >= rateLimit.app[0].max || rateLimit.app[1].count >= rateLimit.app[1].max) reject("App Rate Limit");
 		else if (rateLimit.getLeaderboard.count >= rateLimit.getLeaderboard.max) reject("Method Rate Limit");
-		else fetch(`https://${region.toLowerCase()}${BASE_URL}ranked/v1/leaderboards/by-act/${actId}${options ? `?${Object.entries(options).map(([key, val]) => `${key}=${val}`).join("&")}` : ""}`, { method: "GET", headers: { "X-Riot-Token": riotToken } }).then(res => {
+		else fetch(`https://${region.toLowerCase()}${BASE_URL}${options ? "console/" : ""}ranked/v1/leaderboards/by-act/${actId}${options ? `?${Object.entries(options).map(([key, val]) => `${key}=${val}`).join("&")}` : ""}`, {
+			method: "GET", headers: { "X-Riot-Token": token }
+		}).then(res => {
 			const retryAfterHeader = res.headers.get("retry-after");
 
 			updateRateLimit(rateLimit, "getLeaderboard", res.headers);
 
-			if (retryAfterHeader && res.status == 429) setTimeout(async () => resolve(await getLeaderboard(cache, rateLimits, actId, region, riotToken, options)), parseInt(retryAfterHeader) * 1000);
+			if (retryAfterHeader && res.status == 429) setTimeout(async () => {
+				if (isConsolRegion(region) && isPlatform && typeof riotToken == "string" && options) resolve(await getLeaderboard(cache, rateLimits, actId, region, platform, riotToken, options));
+				else if (!isConsolRegion(region) && typeof riotToken != "string") resolve(await getLeaderboard(cache, rateLimits, actId, region, platform, riotToken));
+				else reject("Platform and region incompatible");
+			}, parseInt(retryAfterHeader) * 1000);
 			else res.json().then(json => {
 				if (res.status.toString()[0] == "2") {
-					cache.leaderboard[region][actId] = { ...json, lastUpdate: Date.now() };
+					if (Array.isArray(json) || typeof json !== "object" || typeof json === null) reject({ reason: "Bad response type", value: json });
+					else {
+						const leaderboard = {
+							actId: json.actId,
+							players: json.players.map((player: ApiPlayer | ApiAnonymousPlayer) => {
+								const res: Player | AnonymousPlayer = "gameName" in player && "puuid" in player && "taghLine" in player ? new Player({
+									leaderboardRank: player.leaderboardRank,
+									numberOfWins: player.numberOfWins,
+									rankedRating: player.rankedRating,
+									gameName: player.gameName,
+									puuid: player.puuid,
+									tagLine: player.tagLine,
+								}, cache, rateLimits, token) : new AnonymousPlayer({ leaderboardRank: player.leaderboardRank, numberOfWins: player.numberOfWins, rankedRating: player.rankedRating });
 
-					resolve(json);
-				} else reject(json);
-			}, () => res.text().then(text => (res.status.toString()[0] == "2" ? resolve : reject)(text)))
-		}, reason => resolve(reason))
-	})
-};
+								return res
+							}),
+							shard: json.shard,
+							totalPlayers: json.totalPlayers,
+						};
 
-/**
- * Get leaderboard for the competitive queue
- * @param actId Act ids can be found using the val-content API.
- * @param riotToken See https://developer.riotgames.com/
- */
-function getConsoleLeaderboard(cache: Cache, rateLimits: RateLimits, actId: string, platformType: PlatformTypes, region: ConsoleRegion, riotToken: string, options: LeaderboardOptions): Promise<Leaderboard | string> {
-	return new Promise((resolve, reject) => {
-		const rateLimit = rateLimits[region], cacheValue = cache.consoleLeaderboard[region][platformType][actId];
+						cache.leaderboard[region][isPlatform ? platform : "_"][actId] = { ...leaderboard, lastUpdate: Date.now() };
 
-		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + 300000 <= Date.now()) resolve(cacheValue);
-		else if (rateLimit.app[0].count >= rateLimit.app[0].max || rateLimit.app[1].count >= rateLimit.app[1].max) reject("App Rate Limit");
-		else if (rateLimit.getConsoleLeaderboard.count >= rateLimit.getConsoleLeaderboard.max) reject("Method Rate Limit");
-		else fetch(`https://${region.toLowerCase()}${BASE_URL}console/ranked/v1/leaderboards/by-act/${actId}?platformType=${platformType}${options ? `&${Object.entries(options).map(([key, val]) => `${key}=${val}`).join("&")}` : ""}`, {
-			method: "GET", headers: { "X-Riot-Token": riotToken }
-		}).then(res => {
-			const retryAfterHeader = res.headers.get("retry-after");
-
-			updateRateLimit(rateLimit, "getConsoleLeaderboard", res.headers);
-
-			if (retryAfterHeader && res.status == 429) setTimeout(async () => resolve(await getConsoleLeaderboard(cache, rateLimits, actId, platformType, region, riotToken, options)), parseInt(retryAfterHeader) * 1000);
-			else res.json().then(json => {
-				if (res.status.toString()[0] == "2") {
-					cache.consoleLeaderboard[region][platformType][actId] = { ...json, lastUpdate: Date.now() };
-					
-					resolve(json);
+						resolve(leaderboard);
+					}
 				} else reject(json);
 			}, () => res.text().then(text => (res.status.toString()[0] == "2" ? resolve : reject)(text)))
 		}, reason => resolve(reason))
@@ -278,7 +246,7 @@ function getStatus(cache: Cache, rateLimits: RateLimits, region: Exclude<Region,
 	return new Promise((resolve, reject) => {
 		const rateLimit = rateLimits[region], cacheValue = cache.status[region];
 		
-		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + 300000 <= Date.now()) resolve(cacheValue);
+		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + TTL <= Date.now()) resolve(cacheValue);
 		else if (rateLimit.app[0].count >= rateLimit.app[0].max || rateLimit.app[1].count >= rateLimit.app[1].max) reject("App Rate Limit");
 		else if (rateLimit.getStatus.count >= rateLimit.getStatus.max) reject("Method Rate Limit");
 		else fetch(`https://${region.toLowerCase()}${BASE_URL}status/v1/platform-data`, { method: "GET", headers: { "X-Riot-Token": riotToken } }).then(res => {
@@ -289,9 +257,56 @@ function getStatus(cache: Cache, rateLimits: RateLimits, region: Exclude<Region,
 			if (retryAfterHeader && res.status == 429) setTimeout(async () => resolve(await getStatus(cache, rateLimits, region, riotToken)), parseInt(retryAfterHeader) * 1000);
 			else res.json().then(json => {
 				if (res.status.toString()[0] == "2") {
-					cache.status[region] = { ...json, lastUpdate: Date.now() };
-					
-					resolve(json);
+					if (Array.isArray(json) || typeof json !== "object" || typeof json === null) reject({ reason: "Bad response type", value: json });
+					else {
+						const status = {
+							id: json.id,
+							incidents: json.incidents.map((incident: ApiStatus) => ({
+								archiveAt: incident.archive_at,
+								createdAt: incident.created_at,
+								id: incident.id,
+								incidentSeverity: incident.incident_severity,
+								maintenanceStatus: incident.maintenance_status,
+								platforms: incident.platforms,
+								titles: incident.titles.map(title => ({ content: title.content, locale: title.locale })),
+								updatedAt: incident.updated_at,
+								updates: incident.updates.map(update => ({
+									author: update.author,
+									createdAt: update.created_at,
+									id: update.id,
+									publish: update.publish,
+									publishLocations: update.publish_locations,
+									translations: update.translations.map(title => ({ content: title.content, locale: title.locale })),
+									updatedAt: update.updated_at,
+								})),
+							})),
+							locales: json.locales,
+							maintenances: json.maintenances.map((maintenance: ApiStatus) => ({
+								archiveAt: maintenance.archive_at,
+								createdAt: maintenance.created_at,
+								id: maintenance.id,
+								incidentSeverity: maintenance.incident_severity,
+								maintenanceStatus: maintenance.maintenance_status,
+								platforms: maintenance.platforms,
+								titles: maintenance.titles.map(title => ({ content: title.content, locale: title.locale })),
+								updatedAt: maintenance.updated_at,
+								updates: maintenance.updates.map(update => ({
+									author: update.author,
+									createdAt: update.created_at,
+									id: update.id,
+									publish: update.publish,
+									publishLocations: update.publish_locations,
+									translations: update.translations.map(title => ({ content: title.content, locale: title.locale })),
+									updatedAt: update.updated_at,
+								})),
+							})),
+							name: json.name
+						};
+	
+						cache.status[region] = { ...status, lastUpdate: Date.now() };
+	
+						resolve(status);
+					}
 				} else reject(json);
 			}, () => res.text().then(text => (res.status.toString()[0] == "2" ? resolve : reject)(text)))
 		}, reason => resolve(reason))
@@ -305,11 +320,11 @@ function getStatus(cache: Cache, rateLimits: RateLimits, region: Exclude<Region,
  * @param actId Act ids can be found using the val-content API.
  * @param riotToken See https://developer.riotgames.com/
  */
-function getContent(cache: Cache, rateLimits: RateLimits, region: Region, riotToken: string, locale: keyof LocalizedNames | undefined): Promise<Content<boolean> | string> {
+function getContent(cache: Cache, rateLimits: RateLimits, region: Region, riotToken: string, locale?: keyof LocalizedNames): Promise<Content<boolean> | string> {
 	return new Promise((resolve, reject) => {
 		const rateLimit = rateLimits[region], cacheValue = cache.content[region][locale || "all"];
 
-		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + 300000 <= Date.now()) resolve(cacheValue);
+		if (cacheValue?.lastUpdate && cacheValue.lastUpdate + TTL <= Date.now()) resolve(cacheValue);
 		else if (rateLimit.app[0].count >= rateLimit.app[0].max || rateLimit.app[1].count >= rateLimit.app[1].max) reject("App Rate Limit");
 		else if (rateLimit.getContent.count >= rateLimit.getContent.max) reject("Method Rate Limit");
 		else fetch(`https://${region.toLowerCase()}${BASE_URL}content/v1/contents${locale ? `?locale=${locale}`: ""}`, { method: "GET", headers: { "X-Riot-Token": riotToken } }).then(res => {
@@ -320,9 +335,110 @@ function getContent(cache: Cache, rateLimits: RateLimits, region: Region, riotTo
 			if (retryAfterHeader && res.status == 429) setTimeout(async () => resolve(await getContent(cache, rateLimits, region, riotToken, locale)), parseInt(retryAfterHeader) * 1000);
 			else res.json().then(json => {
 				if (res.status.toString()[0] == "2") {
-					cache.content[region][locale || "all"] = { ...json, lastUpdate: Date.now() };
-					
-					resolve(json);
+					if (Array.isArray(json) || typeof json !== "object" || typeof json === null) reject({ reason: "Bad response type", value: json });
+					else {
+						const content = {
+							acts: json.acts.map((act: ApiAct) => new (act.localizedNames ? ActWithLocalizedNames : Act)(act, cache, rateLimits, riotToken)),
+							characters: json.characters.map((character: ContentItem) => {
+								const res: Omit<ContentItem, "localizedNames"> & { localizedNames?: LocalizedNames } = { assetName: character.assetName, id: character.id, name: character.name };
+	
+								if (character.localizedNames) res.localizedNames = character.localizedNames;
+	
+								return res;
+							}),
+							charms: json.charms.map((charm: ContentItem) => {
+								const res: Omit<ContentItem, "localizedNames"> & { localizedNames?: LocalizedNames } = { assetName: charm.assetName, id: charm.id, name: charm.name };
+	
+								if (charm.localizedNames) res.localizedNames = charm.localizedNames;
+	
+								return res;
+							}),
+							charmsLevel: json.charms.map((charmLevel: ContentItem) => {
+								const res: Omit<ContentItem, "localizedNames"> & { localizedNames?: LocalizedNames } = { assetName: charmLevel.assetName, id: charmLevel.id, name: charmLevel.name };
+	
+								if (charmLevel.localizedNames) res.localizedNames = charmLevel.localizedNames;
+	
+								return res;
+							}),
+							chromas: json.charms.map((chroma: ContentItem) => {
+								const res: Omit<ContentItem, "localizedNames"> & { localizedNames?: LocalizedNames } = { assetName: chroma.assetName, id: chroma.id, name: chroma.name };
+	
+								if (chroma.localizedNames) res.localizedNames = chroma.localizedNames;
+	
+								return res;
+							}),
+							equips: json.charms.map((equip: ContentItem) => {
+								const res: Omit<ContentItem, "localizedNames"> & { localizedNames?: LocalizedNames } = { assetName: equip.assetName, id: equip.id, name: equip.name };
+	
+								if (equip.localizedNames) res.localizedNames = equip.localizedNames;
+	
+								return res;
+							}),
+							playerCards: json.charms.map((playerCard: ContentItem) => {
+								const res: Omit<ContentItem, "localizedNames"> & { localizedNames?: LocalizedNames } = { assetName: playerCard.assetName, id: playerCard.id, name: playerCard.name };
+	
+								if (playerCard.localizedNames) res.localizedNames = playerCard.localizedNames;
+	
+								return res;
+							}),
+							playerTitles: json.charms.map((playerTitle: ContentItem) => {
+								const res: Omit<ContentItem, "localizedNames"> & { localizedNames?: LocalizedNames } = { assetName: playerTitle.assetName, id: playerTitle.id, name: playerTitle.name };
+	
+								if (playerTitle.localizedNames) res.localizedNames = playerTitle.localizedNames;
+	
+								return res;
+							}),
+							skinLevels: json.charms.map((skinLevel: ContentItem) => {
+								const res: Omit<ContentItem, "localizedNames"> & { localizedNames?: LocalizedNames } = { assetName: skinLevel.assetName, id: skinLevel.id, name: skinLevel.name };
+	
+								if (skinLevel.localizedNames) res.localizedNames = skinLevel.localizedNames;
+	
+								return res;
+							}),
+							skins: json.charms.map((skin: ContentItem) => {
+								const res: Omit<ContentItem, "localizedNames"> & { localizedNames?: LocalizedNames } = { assetName: skin.assetName, id: skin.id, name: skin.name };
+	
+								if (skin.localizedNames) res.localizedNames = skin.localizedNames;
+	
+								return res;
+							}),
+							sprayLevels: json.charms.map((sprayLevel: ContentItem) => {
+								const res: Omit<ContentItem, "localizedNames"> & { localizedNames?: LocalizedNames } = { assetName: sprayLevel.assetName, id: sprayLevel.id, name: sprayLevel.name };
+	
+								if (sprayLevel.localizedNames) res.localizedNames = sprayLevel.localizedNames;
+	
+								return res;
+							}),
+							sprays: json.charms.map((spray: ContentItem) => {
+								const res: Omit<ContentItem, "localizedNames"> & { localizedNames?: LocalizedNames } = { assetName: spray.assetName, id: spray.id, name: spray.name };
+	
+								if (spray.localizedNames) res.localizedNames = spray.localizedNames;
+	
+								return res;
+							}),
+							version: json.version,
+							gameModes: json.gameModes.map((gameMode: ContentItemWithAssetPath) => {
+								const res: Omit<ContentItemWithAssetPath, "localizedNames"> & { localizedNames?: LocalizedNames } = { assetName: gameMode.assetName, id: gameMode.id, name: gameMode.name, assetPath: gameMode.assetPath };
+	
+								if (gameMode.localizedNames) res.localizedNames = gameMode.localizedNames;
+	
+								return res;
+							}),
+							maps: json.maps.map((map: ContentItemWithAssetPath) => {
+								const res: Omit<ContentItemWithAssetPath, "localizedNames"> & { localizedNames?: LocalizedNames } = { assetName: map.assetName, id: map.id, name: map.name, assetPath: map.assetPath };
+	
+								if (map.localizedNames) res.localizedNames = map.localizedNames;
+	
+								return res;
+							})
+						};
+
+						const regionInCache = locale ? cache.content[region] : undefined;
+	
+						if (regionInCache) regionInCache[locale || "all"] = { ...content, lastUpdate: Date.now() };
+	
+						resolve(content);
+					}
 				} else reject(json);
 			}, () => res.text().then(text => (res.status.toString()[0] == "2" ? resolve : reject)(text)))
 		}, reason => resolve(reason))
@@ -340,101 +456,91 @@ export default class Valopi {
 		this.riotToken = riotToken
 
 		this.rateLimits = {
+			"AP (Console)": {
+				app: [{ count: 0, max: Infinity, timeout: null }, { count: 0, max: Infinity, timeout: null }],
+				getLeaderboard: { count: 0, max: Infinity, timeout: null },
+				getPlayerMatches: { count: 0, max: Infinity, timeout: null },
+				getRecentMatches: { count: 0, max: Infinity, timeout: null },
+				getMatch: { count: 0, max: Infinity, timeout: null }
+			},
+			"EU (Console)": {
+				app: [{ count: 0, max: Infinity, timeout: null }, { count: 0, max: Infinity, timeout: null }],
+				getLeaderboard: { count: 0, max: Infinity, timeout: null },
+				getPlayerMatches: { count: 0, max: Infinity, timeout: null },
+				getRecentMatches: { count: 0, max: Infinity, timeout: null },
+				getMatch: { count: 0, max: Infinity, timeout: null }
+			},
+			"NA (Console)": {
+				app: [{ count: 0, max: Infinity, timeout: null }, { count: 0, max: Infinity, timeout: null }],
+				getLeaderboard: { count: 0, max: Infinity, timeout: null },
+				getPlayerMatches: { count: 0, max: Infinity, timeout: null },
+				getRecentMatches: { count: 0, max: Infinity, timeout: null },
+				getMatch: { count: 0, max: Infinity, timeout: null }
+			},
 			AP: {
 				app: [{ count: 0, max: Infinity, timeout: null }, { count: 0, max: Infinity, timeout: null }],
-				getConsoleLeaderboard: { count: 0, max: Infinity, timeout: null },
-				getConsoleMatch: { count: 0, max: Infinity, timeout: null },
-				getConsolePlayerMatches: { count: 0, max: Infinity, timeout: null },
-				getConsoleRecentMatches: { count: 0, max: Infinity, timeout: null },
 				getContent: { count: 0, max: Infinity, timeout: null },
 				getLeaderboard: { count: 0, max: Infinity, timeout: null },
 				getMatch: { count: 0, max: Infinity, timeout: null },
 				getPlayerMatches: { count: 0, max: Infinity, timeout: null },
 				getRecentMatches: { count: 0, max: Infinity, timeout: null },
-				getStatus: { count: 0, max: Infinity, timeout: null },
+				getStatus: { count: 0, max: Infinity, timeout: null }
 			},
 			BR: {
 				app: [{ count: 0, max: Infinity, timeout: null }, { count: 0, max: Infinity, timeout: null }],
-				getConsoleLeaderboard: { count: 0, max: Infinity, timeout: null },
-				getConsoleMatch: { count: 0, max: Infinity, timeout: null },
-				getConsolePlayerMatches: { count: 0, max: Infinity, timeout: null },
-				getConsoleRecentMatches: { count: 0, max: Infinity, timeout: null },
 				getContent: { count: 0, max: Infinity, timeout: null },
 				getLeaderboard: { count: 0, max: Infinity, timeout: null },
 				getMatch: { count: 0, max: Infinity, timeout: null },
 				getPlayerMatches: { count: 0, max: Infinity, timeout: null },
 				getRecentMatches: { count: 0, max: Infinity, timeout: null },
-				getStatus: { count: 0, max: Infinity, timeout: null },
+				getStatus: { count: 0, max: Infinity, timeout: null }
 			},
 			ESPORTS: {
 				app: [{ count: 0, max: Infinity, timeout: null }, { count: 0, max: Infinity, timeout: null }],
-				getConsoleLeaderboard: { count: 0, max: Infinity, timeout: null },
-				getConsoleMatch: { count: 0, max: Infinity, timeout: null },
-				getConsolePlayerMatches: { count: 0, max: Infinity, timeout: null },
-				getConsoleRecentMatches: { count: 0, max: Infinity, timeout: null },
 				getContent: { count: 0, max: Infinity, timeout: null },
-				getLeaderboard: { count: 0, max: Infinity, timeout: null },
 				getMatch: { count: 0, max: Infinity, timeout: null },
 				getPlayerMatches: { count: 0, max: Infinity, timeout: null },
-				getRecentMatches: { count: 0, max: Infinity, timeout: null },
-				getStatus: { count: 0, max: Infinity, timeout: null },
+				getRecentMatches: { count: 0, max: Infinity, timeout: null }
 			},
 			EU: {
 				app: [{ count: 0, max: Infinity, timeout: null }, { count: 0, max: Infinity, timeout: null }],
-				getConsoleLeaderboard: { count: 0, max: Infinity, timeout: null },
-				getConsoleMatch: { count: 0, max: Infinity, timeout: null },
-				getConsolePlayerMatches: { count: 0, max: Infinity, timeout: null },
-				getConsoleRecentMatches: { count: 0, max: Infinity, timeout: null },
 				getContent: { count: 0, max: Infinity, timeout: null },
 				getLeaderboard: { count: 0, max: Infinity, timeout: null },
 				getMatch: { count: 0, max: Infinity, timeout: null },
 				getPlayerMatches: { count: 0, max: Infinity, timeout: null },
 				getRecentMatches: { count: 0, max: Infinity, timeout: null },
-				getStatus: { count: 0, max: Infinity, timeout: null },
+				getStatus: { count: 0, max: Infinity, timeout: null }
 			},
 			KR: {
 				app: [{ count: 0, max: Infinity, timeout: null }, { count: 0, max: Infinity, timeout: null }],
-				getConsoleLeaderboard: { count: 0, max: Infinity, timeout: null },
-				getConsoleMatch: { count: 0, max: Infinity, timeout: null },
-				getConsolePlayerMatches: { count: 0, max: Infinity, timeout: null },
-				getConsoleRecentMatches: { count: 0, max: Infinity, timeout: null },
 				getContent: { count: 0, max: Infinity, timeout: null },
 				getLeaderboard: { count: 0, max: Infinity, timeout: null },
 				getMatch: { count: 0, max: Infinity, timeout: null },
 				getPlayerMatches: { count: 0, max: Infinity, timeout: null },
 				getRecentMatches: { count: 0, max: Infinity, timeout: null },
-				getStatus: { count: 0, max: Infinity, timeout: null },
+				getStatus: { count: 0, max: Infinity, timeout: null }
 			},
 			LATAM: {
 				app: [{ count: 0, max: Infinity, timeout: null }, { count: 0, max: Infinity, timeout: null }],
-				getConsoleLeaderboard: { count: 0, max: Infinity, timeout: null },
-				getConsoleMatch: { count: 0, max: Infinity, timeout: null },
-				getConsolePlayerMatches: { count: 0, max: Infinity, timeout: null },
-				getConsoleRecentMatches: { count: 0, max: Infinity, timeout: null },
 				getContent: { count: 0, max: Infinity, timeout: null },
 				getLeaderboard: { count: 0, max: Infinity, timeout: null },
 				getMatch: { count: 0, max: Infinity, timeout: null },
 				getPlayerMatches: { count: 0, max: Infinity, timeout: null },
 				getRecentMatches: { count: 0, max: Infinity, timeout: null },
-				getStatus: { count: 0, max: Infinity, timeout: null },
+				getStatus: { count: 0, max: Infinity, timeout: null }
 			},
 			NA: {
 				app: [{ count: 0, max: Infinity, timeout: null }, { count: 0, max: Infinity, timeout: null }],
-				getConsoleLeaderboard: { count: 0, max: Infinity, timeout: null },
-				getConsoleMatch: { count: 0, max: Infinity, timeout: null },
-				getConsolePlayerMatches: { count: 0, max: Infinity, timeout: null },
-				getConsoleRecentMatches: { count: 0, max: Infinity, timeout: null },
 				getContent: { count: 0, max: Infinity, timeout: null },
 				getLeaderboard: { count: 0, max: Infinity, timeout: null },
 				getMatch: { count: 0, max: Infinity, timeout: null },
 				getPlayerMatches: { count: 0, max: Infinity, timeout: null },
 				getRecentMatches: { count: 0, max: Infinity, timeout: null },
-				getStatus: { count: 0, max: Infinity, timeout: null },
-			},
+				getStatus: { count: 0, max: Infinity, timeout: null }
+			}
 		}
 
 		this.cache = {
-			consoleLeaderboard: { AP: { playstation: {}, xbox: {} }, EU: { playstation: {}, xbox: {} }, NA: { playstation: {}, xbox: {} } },
 			content: {
 				AP: {
 					"all": null,
@@ -591,14 +697,32 @@ export default class Valopi {
 					"zh-TW": null,
 				}
 			},
-			leaderboard: { AP: {}, BR: {}, EU: {}, KR: {}, LATAM: {}, NA: {} },
-			match: { AP: {}, BR: {}, EU: {}, KR: {}, LATAM: {}, NA: {}, ESPORTS: {} },
-			consoleMatch: { AP: { playstation: {}, xbox: {} }, EU: { playstation: {}, xbox: {} }, NA: { playstation: {}, xbox: {} }, },
-			playerMatches: { AP: {}, BR: {}, EU: {}, KR: {}, LATAM: {}, NA: {}, ESPORTS: {} },
-			recentMatches: { AP: {}, BR: {}, EU: {}, KR: {}, LATAM: {}, NA: {}, ESPORTS: {} },
-			status: { AP: null, BR: null, EU: null, KR: null, LATAM: null, NA: null },
-			consolePlayerMatches: { AP: { playstation: {}, xbox: {} }, EU: { playstation: {}, xbox: {} }, NA: { playstation: {}, xbox: {} } },
-			consoleRecentMatches: { AP: {}, EU: {}, NA: {} }
+			leaderboard: {
+				AP: { _: {}, playstation: {}, xbox: {} },
+				BR: { _: {}, playstation: {}, xbox: {} },
+				EU: { _: {}, playstation: {}, xbox: {} },
+				KR: { _: {}, playstation: {}, xbox: {} },
+				LATAM: { _: {}, playstation: {}, xbox: {} },
+				NA: { _: {}, playstation: {}, xbox: {} },
+				"AP (Console)": { _: {}, playstation: {}, xbox: {} },
+				"EU (Console)": { _: {}, playstation: {}, xbox: {} },
+				"NA (Console)": { _: {}, playstation: {}, xbox: {} }
+			},
+			match: { AP: {}, BR: {}, EU: {}, KR: {}, LATAM: {}, NA: {}, ESPORTS: {}, "AP (Console)": {}, "EU (Console)": {}, "NA (Console)": {} },
+			playerMatches: {
+				AP: { _: {}, playstation: {}, xbox: {} },
+				BR: { _: {}, playstation: {}, xbox: {} },
+				EU: { _: {}, playstation: {}, xbox: {} },
+				KR: { _: {}, playstation: {}, xbox: {} },
+				LATAM: { _: {}, playstation: {}, xbox: {} },
+				NA: { _: {}, playstation: {}, xbox: {} },
+				ESPORTS: { _: {}, playstation: {}, xbox: {} },
+				"AP (Console)": { _: {}, playstation: {}, xbox: {} },
+				"EU (Console)": { _: {}, playstation: {}, xbox: {} },
+				"NA (Console)": { _: {}, playstation: {}, xbox: {} }
+			},
+			recentMatches: { AP: {}, BR: {}, EU: {}, KR: {}, LATAM: {}, NA: {}, ESPORTS: {}, "AP (Console)": {}, "EU (Console)": {}, "NA (Console)": {} },
+			status: { AP: null, BR: null, EU: null, KR: null, LATAM: null, NA: null }
 		}
 	}
 
@@ -618,49 +742,35 @@ export default class Valopi {
 	/**
 	 * Get VALORANT status for the given platform
 	 */
-	getStatus(region: Exclude<Region, "ESPORTS">): Promise<PlatformData | string> { return getStatus(this.cache, this.rateLimits, region, this.riotToken) };
+	getStatus(region: Exclude<Region, "ESPORTS">) { return getStatus(this.cache, this.rateLimits, region, this.riotToken) };
 
 	/**
 	 * Get leaderboard for the competitive queue
 	 * @param actId Act ids can be found using the val-content API.
 	 */
-	getLeaderboard(actId: string, options: LeaderboardOptions, region: Exclude<Region, "ESPORTS">): Promise<Leaderboard | string> { return getLeaderboard(this.cache, this.rateLimits, actId, region, this.riotToken, options) };
-
-	/**
-	 * Get leaderboard for the competitive queue
-	 * @param actId Act ids can be found using the val-content API.
-	 */
-	getConsoleLeaderboard(actId: string, platformType: PlatformTypes, options: LeaderboardOptions, region: ConsoleRegion): Promise<Leaderboard | string> { return getConsoleLeaderboard(this.cache, this.rateLimits, actId, platformType, region, this.riotToken, options) };
-
-	/**
-	 * Get matchlist for games played by puuid 
-	 */
-	getPlayerMatches(puuid: Puuid, region: Region) { return getPlayerMatches(this.cache, this.rateLimits, puuid, region, this.riotToken) };
+	getLeaderboard(actId: string, region: Exclude<Region, "ESPORTS">, options: LeaderboardOptions): Promise<Leaderboard | string>
+	getLeaderboard(actId: string, region: ConsoleRegion, platformType: PlatformTypes, options: LeaderboardOptions): Promise<Leaderboard | string>
+	getLeaderboard(actId: string, region: Exclude<Region, "ESPORTS"> | ConsoleRegion, platform: PlatformTypes | LeaderboardOptions, options?: LeaderboardOptions): Promise<Leaderboard | string> {
+		if (isConsolRegion(region) && typeof platform == "string" && isPlatformType(platform) && options) return getLeaderboard(this.cache, this.rateLimits, actId, region, platform, this.riotToken, options);
+		else if (!isConsolRegion(region) && typeof platform != "string") return getLeaderboard(this.cache, this.rateLimits, actId, region, this.riotToken, platform);
+		else return new Promise((_resolve, reject) => reject("Platform and region incompatible"));
+	};
 
 	/**
 	 * Get matchlist for games played by puuid 
 	 */
-	getConsolePlayerMatches(puuid: Puuid, region: ConsoleRegion, platform: PlatformTypes) { return getConsolePlayerMatches(this.cache, this.rateLimits, puuid, region, platform, this.riotToken) };
+	getPlayerMatches(puuid: Puuid, region: Region): Promise<MatchList | string>
+	getPlayerMatches(puuid: Puuid, region: ConsoleRegion, platform?: PlatformTypes): Promise<MatchList | string>
+	getPlayerMatches(puuid: Puuid, region: Region | ConsoleRegion, platform?: PlatformTypes): Promise<MatchList | string> {
+		if (platform && isConsolRegion(region)) return getPlayerMatches(this.cache, this.rateLimits, puuid, region, platform, this.riotToken);
+		else if (!isConsolRegion(region)) return getPlayerMatches(this.cache, this.rateLimits, puuid, region, this.riotToken);
+		else return new Promise((_resolve, reject) => reject("Platform and region incompatible"));
+	};
 
 	/**
 	 * Get match by id
 	 */
-	getMatch(matchId: string, region: Region) { return getMatch(this.cache, this.rateLimits, matchId, region, this.riotToken) };
-
-	/**
-	 * Get match by id
-	 */
-	getConsoleMatch(matchId: string, region: ConsoleRegion, platform: PlatformTypes) { return getConsoleMatch(this.cache, this.rateLimits, matchId, region, platform, this.riotToken) };
-	
-	/**
-   * Get recent matches
-   * 
-   * Returns a list of match ids that have completed in the last 10 minutes for live regions and 12 hours for the esports routing value.
-   * NA/LATAM/BR share a match history deployment.
-   * As such, recent matches will return a combined list of matches from those three regions.
-   * Requests are load balanced so you may see some inconsistencies as matches are added/removed from the list.
-	 */
-	getRecentMatches(queue: Queues, region: Region): Promise<RecentMatches | string> { return getRecentMatches(this.cache, this.rateLimits, queue, region, this.riotToken); };
+	getMatch(matchId: string, region: Region | ConsoleRegion) { return getMatch(this.cache, this.rateLimits, matchId, region, this.riotToken) };
 
 	/**
    * Get recent matches
@@ -670,44 +780,504 @@ export default class Valopi {
    * As such, recent matches will return a combined list of matches from those three regions.
    * Requests are load balanced so you may see some inconsistencies as matches are added/removed from the list.
 	 */
-	getConsoleRecentMatches(queue: ConsoleQueues, region: ConsoleRegion): Promise<RecentMatches | string> { return getConsoleRecentMatches(this.cache, this.rateLimits, queue, region, this.riotToken); };
+	getRecentMatches(queue: Queues, region: Region): Promise<RecentMatches | string>
+	getRecentMatches(queue: ConsoleQueues, region: ConsoleRegion): Promise<RecentMatches | string>
+	getRecentMatches(queue: Queues | ConsoleQueues, region: Region | ConsoleRegion): Promise<RecentMatches | string> {
+		if (isConsolRegion(region) && isConsoleQueue(queue)) return getRecentMatches(this.cache, this.rateLimits, queue, region, this.riotToken);
+		else if (!isConsolRegion(region) && !isConsoleQueue(queue)) return getRecentMatches(this.cache, this.rateLimits, queue, region, this.riotToken);
+		else return new Promise((_resolve, reject) => reject("Queue and region incompatible"))
+	};
+}
+
+class NonDeathmatchTeam {
+	constructor(team: ApiTeam, cache: Cache, rateLimits: RateLimits, riotToken: string) {
+		this.teamId = team.teamId;
+		this.team = new PlayerInfo(team.teamId, cache, rateLimits, riotToken);
+		this.won = team.won;
+		this.roundsPlayed = team.roundsPlayed;
+		this.roundsWon = team.roundsWon;
+		this.numPoints = team.numPoints;
+	}
+
+	/**
+	 * This is an arbitrary string. Red and Blue in bomb modes. The puuid of the player in deathmatch.
+	 */
+	readonly teamId: Puuid;
+	readonly team: PlayerInfo;
+	readonly won: boolean;
+	readonly roundsPlayed: number;
+	readonly roundsWon: number;
+	/**
+	 * Team points scored. Number of kills in deathmatch.
+	 */
+	readonly numPoints: number
+}
+
+class DeathmatchTeam {
+	constructor(team: ApiTeam) {
+		if (team.teamId != "Blue" || team.teamId != "Blue") throw new Error("Invalid team id");
+
+		this.teamId = team.teamId;
+		this.won = team.won;
+		this.roundsPlayed = team.roundsPlayed;
+		this.roundsWon = team.roundsWon;
+		this.numPoints = team.numPoints;
+	}
+
+	/**
+	 * This is an arbitrary string. Red and Blue in bomb modes. The puuid of the player in deathmatch.
+	 */
+	readonly teamId: "Red" | "Blue";
+	readonly won: boolean;
+	readonly roundsPlayed: number;
+	readonly roundsWon: number;
+	/**
+	 * Team points scored. Number of kills in deathmatch.
+	 */
+	readonly numPoints: number
+}
+
+class Coach {
+	constructor(coach: ApiCoach, cache: Cache, rateLimits: RateLimits, riotToken: string) {
+		this.player = new PlayerInfo(coach.puuid, cache, rateLimits, riotToken);
+		this.teamId = coach.teamId;
+	}
+
+	readonly player: PlayerInfo;
+	readonly teamId: string;
+}
+
+class PlayerLocations {
+	constructor(playerLocations: ApiPlayerLocations, cache: Cache, rateLimits: RateLimits, riotToken: string) {
+		this.player = new PlayerInfo(playerLocations.puuid, cache, rateLimits, riotToken);
+		this.viewRadians = playerLocations.viewRadians;
+		this.location = playerLocations.location;
+	}
+
+	readonly player: PlayerInfo;
+	readonly viewRadians: number;
+	readonly location: Location;
+}
+
+class Damage {
+	constructor(damage: ApiDamage, cache: Cache, rateLimits: RateLimits, riotToken: string) {
+		this.receiver = new PlayerInfo(damage.receiver, cache, rateLimits, riotToken);
+		this.damage = damage.damage;
+		this.legshots = damage.legshots;
+		this.bodyshots = damage.bodyshots;
+		this.headshots = damage.headshots;
+	}
+
+	readonly receiver: PlayerInfo;
+	readonly damage: number;
+	readonly legshots: number;
+	readonly bodyshots: number;
+	readonly headshots: number;
+}
+
+class PlayerRoundStats {
+	constructor(playerRoundStats: ApiPlayerRoundStats, cache: Cache, rateLimits: RateLimits, riotToken: string) {
+		this.player = new PlayerInfo(playerRoundStats.puuid, cache, rateLimits, riotToken);
+		this.kills = playerRoundStats.kills.map(kill => new Kill(kill, cache, rateLimits, riotToken));
+		this.damage = playerRoundStats.damage.map(damage => new Damage(damage, cache, rateLimits, riotToken));
+		this.score = playerRoundStats.score;
+		this.economy = {
+			armor: playerRoundStats.economy.armor,
+			loadoutValue: playerRoundStats.economy.loadoutValue,
+			remaining: playerRoundStats.economy.remaining,
+			spent: playerRoundStats.economy.spent,
+			weapon: playerRoundStats.economy.weapon,
+		};
+		this.ability = {
+			ability1Effects: playerRoundStats.ability.ability1Effects,
+			ability2Effects: playerRoundStats.ability.ability2Effects,
+			grenadeEffects: playerRoundStats.ability.grenadeEffects,
+			ultimateEffects: playerRoundStats.ability.ultimateEffects,
+		};
+	}
+
+	readonly player: PlayerInfo;
+	readonly kills: Kill[];
+	readonly damage: Damage[];
+	readonly score: number;
+	readonly economy: Economy;
+	readonly ability: Ability;
+}
+
+class PlayerInfo {
+	constructor(puuid: Puuid, cache: Cache, rateLimits: RateLimits, riotToken: string) {
+		this.puuid = puuid
+
+		this.cache = cache;
+		this.rateLimits = rateLimits;
+		this.riotToken = riotToken;
+	}
+
+	/**
+	 * PUUID
+	 */
+	readonly puuid: Puuid;
+
+	private readonly riotToken: string;
+	private readonly rateLimits: RateLimits
+	private readonly cache: Cache;
+
+	matches(region: Region): Promise<MatchList | string>
+	matches(region: ConsoleRegion, platform: PlatformTypes): Promise<MatchList | string>
+	matches(region: Region | ConsoleRegion, platform?: PlatformTypes): Promise<MatchList | string> {
+		if (platform && isConsolRegion(region)) return getPlayerMatches(this.cache, this.rateLimits, this.puuid, region, platform, this.riotToken);
+		else if (!isConsolRegion(region)) return getPlayerMatches(this.cache, this.rateLimits, this.puuid, region, this.riotToken);
+		else return new Promise((_resolve, reject) => reject("Platform and region incompatible"));
+	};
+}
+
+class Kill {
+	constructor(kill: ApiKill, cache: Cache, rateLimits: RateLimits, riotToken: string) {
+		this.timeSinceGameStartMillis = kill.timeSinceGameStartMillis;
+		this.timeSinceRoundStartMillis = kill.timeSinceRoundStartMillis;
+		this.killer = new PlayerInfo(kill.killer, cache, rateLimits, riotToken);
+		this.victim = new PlayerInfo(kill.victim, cache, rateLimits, riotToken);
+		this.victimLocation = {
+			x: kill.victimLocation.x,
+			y: kill.victimLocation.y,
+		};
+		this.assistants = kill.assistants.map(assistant => new PlayerInfo(assistant, cache, rateLimits, riotToken));
+		this.playerLocations = kill.playerLocations.map(playerLocation => new PlayerLocations(playerLocation, cache, rateLimits, riotToken));
+		this.finishingDamage = {
+			damageItem: kill.finishingDamage.damageItem,
+			damageType: kill.finishingDamage.damageType,
+			isSecondaryFireMode: kill.finishingDamage.isSecondaryFireMode,
+		};
+	}
+
+	readonly timeSinceGameStartMillis: number;
+	readonly timeSinceRoundStartMillis: number;
+	readonly killer: PlayerInfo;
+	readonly victim: PlayerInfo;
+	readonly victimLocation: Location;
+	readonly assistants: PlayerInfo[];
+	readonly playerLocations: PlayerLocations[];
+	readonly finishingDamage: FinishingDamage;
+}
+
+class RoundResult {
+	constructor(roundResult: ApiRoundResult, cache: Cache, rateLimits: RateLimits, riotToken: string) {
+		this.roundNum = roundResult.roundNum;
+		this.roundResult = roundResult.roundResult;
+		this.roundCeremony = roundResult.roundCeremony;
+		this.winningTeam = roundResult.winningTeam;
+		this.bombPlanter = new PlayerInfo(roundResult.bombPlanter, cache, rateLimits, riotToken);
+		this.bombDefuser = new PlayerInfo(roundResult.bombDefuser, cache, rateLimits, riotToken);
+		this.plantRoundTime = roundResult.plantRoundTime;
+		this.plantPlayerLocations = roundResult.plantPlayerLocations.map(playerLocation => new PlayerLocations(playerLocation, cache, rateLimits, riotToken));
+		this.plantLocation = roundResult.plantLocation;
+		this.plantSite = roundResult.plantSite;
+		this.defuseRoundTime = roundResult.defuseRoundTime;
+		this.defusePlayerLocations = roundResult.defusePlayerLocations.map(playerLocation => new PlayerLocations(playerLocation, cache, rateLimits, riotToken));;
+		this.playerStats = roundResult.playerStats.map(playerRoundStats => new PlayerRoundStats(playerRoundStats, cache, rateLimits, riotToken));
+		this.roundResultCode = roundResult.roundResultCode;
+	}
+
+	readonly roundNum: number;
+	readonly roundResult: string;
+	readonly roundCeremony: string;
+	readonly winningTeam: string;
+	readonly bombPlanter: PlayerInfo;
+	readonly bombDefuser: PlayerInfo;
+	readonly plantRoundTime: number;
+	readonly plantPlayerLocations: PlayerLocations[];
+	readonly plantLocation: Location;
+	readonly plantSite: string;
+	readonly defuseRoundTime: number;
+	readonly defusePlayerLocations: PlayerLocations[];
+	readonly playerStats: PlayerRoundStats[];
+	readonly roundResultCode: string;
+}
+
+class MatchPlayer {
+	constructor(player: ApiMatchPlayer, cache: Cache, rateLimits: RateLimits, riotToken: string) {
+		this.puuid = player.puuid;
+		this.gameName = player.gameName;
+		this.tagLine = player.tagLine;
+		this.teamId = player.teamId;
+		this.partyId = player.partyId;
+		this.characterId = player.characterId;
+		this.stats = {
+			abilityCasts: {
+				ability1Casts: player.stats.abilityCasts.ability1Casts,
+				ability2Casts: player.stats.abilityCasts.ability2Casts,
+				grenadeCasts: player.stats.abilityCasts.grenadeCasts,
+				ultimateCasts: player.stats.abilityCasts.ultimateCasts,
+			},
+			assists: player.stats.assists,
+			deaths: player.stats.deaths,
+			kills: player.stats.kills,
+			playtimeMillis: player.stats.playtimeMillis,
+			roundsPlayed: player.stats.roundsPlayed,
+			score: player.stats.score,
+		};
+		this.competitiveTier = player.competitiveTier;
+		this.playerCard = player.playerCard;
+		this.playerTitle = player.playerTitle;
+
+		this.cache = cache;
+		this.rateLimits = rateLimits;
+		this.riotToken = riotToken;
+	}
+
+	readonly puuid: Puuid;
+	readonly gameName: string;
+	readonly tagLine: string;
+	readonly teamId: string;
+	readonly partyId: string;
+	readonly characterId: string;
+	readonly stats: PlayerStats;
+	readonly competitiveTier: number;
+	readonly playerCard: string;
+	readonly playerTitle: string;
+
+	private readonly riotToken: string;
+	private readonly rateLimits: RateLimits
+	private readonly cache: Cache;
+
+	matches(region: Region): Promise<MatchList | string>
+	matches(region: ConsoleRegion, platform: PlatformTypes): Promise<MatchList | string>
+	matches(region: Region | ConsoleRegion, platform?: PlatformTypes): Promise<MatchList | string> {
+		if (platform && isConsolRegion(region)) return getPlayerMatches(this.cache, this.rateLimits, this.puuid, region, platform, this.riotToken);
+		else if (!isConsolRegion(region)) return getPlayerMatches(this.cache, this.rateLimits, this.puuid, region, this.riotToken);
+		else return new Promise((_resolve, reject) => reject("Platform and region incompatible"));
+	};
+}
+
+class RecentMatch {
+	constructor(matchId: string, cache: Cache, rateLimits: RateLimits, region: Region | ConsoleRegion, riotToken: string) {
+		this.matchId = matchId;
+
+		this.cache = cache;
+		this.rateLimits = rateLimits;
+		this.region = region;
+		this.riotToken = riotToken;
+	}
+
+	readonly matchId: string;
+
+	private readonly riotToken: string;
+	private readonly rateLimits: RateLimits
+	private readonly region: Region | ConsoleRegion;
+	private readonly cache: Cache;
+
+	match() { return getMatch(this.cache, this.rateLimits, this.matchId, this.region, this.riotToken) }
+}
+
+class MatchListEntry {
+	constructor(matchEntry: ApiMatchListEntry, cache: Cache, rateLimits: RateLimits, region: Region | ConsoleRegion, riotToken: string) {
+		this.matchId = matchEntry.matchId;
+		this.gameStartTimeMillis = matchEntry.gameStartTimeMillis;
+		this.queueId = matchEntry.queueId;
+
+		this.cache = cache;
+		this.rateLimits = rateLimits;
+		this.region = region;
+		this.riotToken = riotToken;
+	}
+
+	readonly matchId: string;
+	readonly gameStartTimeMillis: number;
+	readonly queueId: string;
+
+	private readonly riotToken: string;
+	private readonly rateLimits: RateLimits
+	private readonly region: Region | ConsoleRegion;
+	private readonly cache: Cache;
+
+	match() { return getMatch(this.cache, this.rateLimits, this.matchId, this.region, this.riotToken) }
+}
+
+class Act {
+	constructor(act: ApiAct | Omit<ApiAct, "localizedNames">, cache: Cache, rateLimits: RateLimits, riotToken: string) {
+		this.name = act.name;
+		this.id = act.id;
+		this.isActive = act.isActive;
+
+		this.cache = cache;
+		this.rateLimits = rateLimits;
+		this.riotToken = riotToken;
+	}
+
+	readonly name: string;
+	readonly id: string;
+	readonly isActive: boolean;
+
+	private readonly riotToken: string;
+	private readonly rateLimits: RateLimits
+	private readonly cache: Cache;
+
+	leaderboard(region: Exclude<Region, "ESPORTS">, options?: LeaderboardOptions) { return getLeaderboard(this.cache, this.rateLimits, this.id, region, this.riotToken, options || {}) }
+}
+
+class ActWithLocalizedNames extends Act {
+	constructor(act: ApiAct | Omit<ApiAct, "localizedNames">, cache: Cache, rateLimits: RateLimits, riotToken: string) {
+		super(act, cache, rateLimits, riotToken);
+
+		if ("localizedNames" in act) this.localizedNames = act.localizedNames;
+	}
+
+	readonly localizedNames?: LocalizedNames;
+}
+
+class AnonymousPlayer {
+	constructor(player: ApiAnonymousPlayer) {
+		this.leaderboardRank = player.leaderboardRank;
+		this.numberOfWins = player.numberOfWins;
+		this.rankedRating = player.rankedRating;
+	}
+
+	readonly leaderboardRank: number;
+	readonly rankedRating: number;
+	readonly numberOfWins: number;
+}
+
+class Player extends AnonymousPlayer {
+	constructor(player: ApiPlayer, cache: Cache, rateLimits: RateLimits, riotToken: string) {
+		super(player)
+
+		this.gameName = player.gameName;
+		this.puuid = player.puuid;
+		this.tagLine = player.tagLine;
+
+		this.cache = cache;
+		this.rateLimits = rateLimits;
+		this.riotToken = riotToken;
+	}
+
+	/**
+	 * This field may be omitted if the player has been anonymized.
+	 */
+	readonly puuid: Puuid;
+	/**
+	 * This field may be omitted if the player has been anonymized.
+	 */
+	readonly gameName: string;
+	/**
+	 * This field may be omitted if the player has been anonymized.
+	 */
+	readonly tagLine: string;
+
+	private readonly riotToken: string;
+	private readonly rateLimits: RateLimits
+	private readonly cache: Cache;
+
+	matches(region: Region): Promise<MatchList | string>
+	matches(region: ConsoleRegion, platform: PlatformTypes): Promise<MatchList | string>
+	matches(region: Region | ConsoleRegion, platform?: PlatformTypes): Promise<MatchList | string> {
+		if (platform && isConsolRegion(region)) return getPlayerMatches(this.cache, this.rateLimits, this.puuid, region, platform, this.riotToken);
+		else if (!isConsolRegion(region)) return getPlayerMatches(this.cache, this.rateLimits, this.puuid, region, this.riotToken);
+		else return new Promise((_resolve, reject) => reject("Platform and region incompatible"));
+	};
 }
 
 // Types
-
-type FunctionName = "getContent" | "getStatus" | "getLeaderboard" | "getConsoleLeaderboard" | "getPlayerMatches" | "getConsolePlayerMatches" | "getMatch" | "getConsoleMatch" | "getRecentMatches" | "getConsoleRecentMatches";
-
-export type RateLimits = Record<Region, Record<"app", [RateLimit, RateLimit]> & Record<FunctionName, RateLimit>>;
 
 export type Puuid = string;
 
 export type Region = "AP" | "BR" | "ESPORTS" | "EU" | "KR" | "LATAM" | "NA";
 
-export type ConsoleRegion = "AP" | "EU" | "NA";
+export type ConsoleRegion = "AP (Console)" | "EU (Console)" | "NA (Console)";
 
 // Interfaces
 
-export interface Cache {
+interface Cache {
 	content: Record<Region, Record<keyof LocalizedNames, Content<true> & { lastUpdate: number } | null> & Record<"all", Content<false> & { lastUpdate: number } | null>>;
 	status: Record<Exclude<Region, "ESPORTS">, PlatformData & { lastUpdate: number } | null>;
-	leaderboard: Record<Exclude<Region, "ESPORTS">, Record<string, Leaderboard & { lastUpdate: number }>>;
-	consoleLeaderboard: Record<ConsoleRegion, Record<PlatformTypes, Record<string, Leaderboard & { lastUpdate: number }>>>;
-	playerMatches: Record<Region, Record<Puuid, MatchList & { lastUpdate: number }>>;
-	consolePlayerMatches: Record<ConsoleRegion, Record<PlatformTypes, Record<Puuid, MatchList & { lastUpdate: number }>>>;
-	match: Record<Region, Record<string, Match & { lastUpdate: number }>>;
-	consoleMatch: Record<ConsoleRegion, Record<PlatformTypes, Record<string, Match & { lastUpdate: number }>>>;
-	recentMatches: Record<Region, Record<string, RecentMatches & { lastUpdate: number }>>;
-	consoleRecentMatches: Record<ConsoleRegion, Record<string, RecentMatches & { lastUpdate: number }>>;
+	leaderboard: Record<Exclude<Region, "ESPORTS"> | ConsoleRegion, Record<PlatformTypes | "_", Record<string, Leaderboard & { lastUpdate: number }>>>;
+	playerMatches: Record<Region | ConsoleRegion, Record<PlatformTypes | "_", Record<Puuid, MatchList & { lastUpdate: number }>>>;
+	match: Record<Region | ConsoleRegion, Record<string, Match & { lastUpdate: number }>>;	
+	recentMatches: Record<Region | ConsoleRegion, Record<string, RecentMatches & { lastUpdate: number }>>;
 }
 
-export interface Act {
-	name: string;
-	/**
-	 * This field is excluded from the response when a locale is set
-	 */
-	localizedNames?: LocalizedNames | undefined;
-	id: string;
-	isActive: boolean;
+interface RateLimits {
+	AP: {
+		app: [RateLimit, RateLimit];
+		getContent: RateLimit;
+		getStatus: RateLimit;
+		getLeaderboard: RateLimit;
+		getPlayerMatches: RateLimit;
+		getRecentMatches: RateLimit;
+		getMatch: RateLimit;
+	};
+	BR: {
+		app: [RateLimit, RateLimit];
+		getContent: RateLimit;
+		getStatus: RateLimit;
+		getLeaderboard: RateLimit;
+		getPlayerMatches: RateLimit;
+		getRecentMatches: RateLimit;
+		getMatch: RateLimit;
+	};
+	ESPORTS: {
+		app: [RateLimit, RateLimit];
+		getContent: RateLimit;
+		getPlayerMatches: RateLimit;
+		getRecentMatches: RateLimit;
+		getMatch: RateLimit
+	};
+	EU: {
+		app: [RateLimit, RateLimit];
+		getContent: RateLimit;
+		getStatus: RateLimit;
+		getLeaderboard: RateLimit;
+		getPlayerMatches: RateLimit;
+		getRecentMatches: RateLimit;
+		getMatch: RateLimit;
+	};
+	KR: {
+		app: [RateLimit, RateLimit];
+		getContent: RateLimit;
+		getStatus: RateLimit;
+		getLeaderboard: RateLimit;
+		getPlayerMatches: RateLimit;
+		getRecentMatches: RateLimit;
+		getMatch: RateLimit;
+	};
+	LATAM: {
+		app: [RateLimit, RateLimit];
+		getContent: RateLimit;
+		getStatus: RateLimit;
+		getLeaderboard: RateLimit;
+		getPlayerMatches: RateLimit;
+		getRecentMatches: RateLimit;
+		getMatch: RateLimit;
+	};
+	NA: {
+		app: [RateLimit, RateLimit];
+		getContent: RateLimit;
+		getStatus: RateLimit;
+		getLeaderboard: RateLimit;
+		getPlayerMatches: RateLimit;
+		getRecentMatches: RateLimit;
+		getMatch: RateLimit;
+	};
+	"AP (Console)": {
+		app: [RateLimit, RateLimit];
+		getLeaderboard: RateLimit;
+		getPlayerMatches: RateLimit;
+		getRecentMatches: RateLimit;
+		getMatch: RateLimit;
+	};
+	"EU (Console)": {
+		app: [RateLimit, RateLimit];
+		getLeaderboard: RateLimit;
+		getPlayerMatches: RateLimit;
+		getRecentMatches: RateLimit;
+		getMatch: RateLimit;
+	};
+	"NA (Console)": {
+		app: [RateLimit, RateLimit];
+		getLeaderboard: RateLimit;
+		getPlayerMatches: RateLimit;
+		getRecentMatches: RateLimit;
+		getMatch: RateLimit;
+	};
 }
 
 export interface Content<LocaleIsSet extends boolean> {
@@ -725,110 +1295,23 @@ export interface Content<LocaleIsSet extends boolean> {
 	charmsLevel: (LocaleIsSet extends true ? Omit<ContentItem, "localizedNames"> : ContentItem)[];
 	playerCards: (LocaleIsSet extends true ? Omit<ContentItem, "localizedNames"> : ContentItem)[];
 	playerTitles: (LocaleIsSet extends true ? Omit<ContentItem, "localizedNames"> : ContentItem)[];
-	acts: (LocaleIsSet extends true ? Omit<Act, "localizedNames"> : Act)[];
+	acts: (LocaleIsSet extends true ? Act : ActWithLocalizedNames)[];
 }
 
 export interface RecentMatches {
 	currentTime: number;
 	/**
-	 * A list of recent match ids.
+	 * A list of recent match.
 	 */
-	matchIds: string[];
+	matches: RecentMatch[];
 }
 
 export interface Match {
 	matchInfo: MatchInfo;
 	players: MatchPlayer[];
 	coaches: Coach[];
-	teams: Team[];
+	teams: (NonDeathmatchTeam | DeathmatchTeam)[];
 	roundResults: RoundResult[];
-}
-
-export interface RoundResult {
-	roundNum: number;
-	roundResult: string;
-	roundCeremony: string;
-	winningTeam: string;
-	/**
-	 * PUUID of player
-	 */
-	bombPlanter: Puuid;
-	/**
-	 * PUUID of player
-	 */
-	bombDefuser: Puuid;
-	plantRoundTime: number;
-	plantPlayerLocations: PlayerLocations[];
-	plantLocation: Location;
-	plantSite: string;
-	defuseRoundTime: number;
-	defusePlayerLocations: PlayerLocations[];
-	playerStats: PlayerRoundStats[];
-	roundResultCode: string;
-}
-
-export interface PlayerRoundStats {
-	puuid: Puuid;
-	kills: Kill[];
-	damage: Damage[];
-	score: number;
-	economy: Economy;
-	ability: Ability;
-}
-
-export interface Damage {
-	/**
-	 * PUUID
-	 */
-	receiver: Puuid;
-	damage: number;
-	legshots: number;
-	bodyshots: number;
-	headshots: number;
-}
-
-export interface Kill {
-	timeSinceGameStartMillis: number;
-	timeSinceRoundStartMillis: number;
-	/**
-	 * PUUID
-	 */
-	killer: Puuid;
-	/**
-	 * PUUID
-	 */
-	victim: Puuid;
-	victimLocation: Location;
-	/**
-	 * List of PUUIDs
-	 */
-	assistants: string[];
-	playerLocations: PlayerLocations[];
-	finishingDamage: FinishingDamage;
-}
-
-export interface PlayerLocations {
-	puuid: Puuid;
-	viewRadians: number;
-	location: Location;
-}
-
-export interface Coach {
-	puuid: Puuid;
-	teamId: string;
-}
-
-export interface MatchPlayer {
-	puuid: Puuid;
-	gameName: string;
-	tagLine: string;
-	teamId: string;
-	partyId: string;
-	characterId: string;
-	stats: PlayerStats;
-	competitiveTier: number;
-	playerCard: string;
-	playerTitle: string;
 }
 
 export interface MatchInfo {
@@ -850,30 +1333,6 @@ export interface MatchList {
 	history: MatchListEntry[];
 }
 
-export interface MatchListEntry {
-	matchId: string;
-	gameStartTimeMillis: number;
-	queueId: string;
-}
-
-export interface Player {
-	/**
-	 * This field may be omitted if the player has been anonymized.
-	 */
-	puuid?: Puuid;
-	/**
-	 * This field may be omitted if the player has been anonymized.
-	 */
-	gameName?: string;
-	/**
-	 * This field may be omitted if the player has been anonymized.
-	 */
-	tagLine?: string;
-	leaderboardRank: number;
-	rankedRating: number;
-	numberOfWins: number;
-}
-
 export interface Leaderboard {
 	/**
 	 * The shard for the given leaderboard.
@@ -887,7 +1346,7 @@ export interface Leaderboard {
 	 * The total number of players in the leaderboard.
 	 */
 	totalPlayers: number;
-	players: Player[];
+	players: (Player | AnonymousPlayer)[];
 };
 
 export interface RateLimit {
@@ -924,20 +1383,6 @@ export interface AbilityCasts {
 	ultimateCasts: number;
 }
 
-export interface Team {
-	/**
-	 * This is an arbitrary string. Red and Blue in bomb modes. The puuid of the player in deathmatch.
-	 */
-	teamId: "Red" | "Blue" | Puuid;
-	won: boolean;
-	roundsPlayed: number;
-	roundsWon: number;
-	/**
-	 * Team points scored. Number of kills in deathmatch.
-	 */
-	numPoints: number;
-}
-
 export interface PlatformData {
 	id: string;
 	name: string;
@@ -948,13 +1393,13 @@ export interface PlatformData {
 
 export interface Status {
 	id: number;
-	maintenance_status: MaintenanceStatus;
-	incident_severity: IncidentSeverities;
+	maintenanceStatus: MaintenanceStatus;
+	incidentSeverity: IncidentSeverities;
 	titles: StatusContent[];
 	updates: Update[];
-	created_at: string;
-	archive_at: string;
-	updated_at: string;
+	createdAt: string;
+	archiveAt: string;
+	updatedAt: string;
 	platforms: Platforms;
 }
 
@@ -967,10 +1412,10 @@ export interface Update {
 	id: number;
 	author: string;
 	publish: boolean;
-	publish_locations: PublishLocations[];
+	publishLocations: PublishLocations[];
 	translations: StatusContent[];
-	created_at: string;
-	updated_at: string;
+	createdAt: string;
+	updatedAt: string;
 }
 
 export interface LocalizedNames {
@@ -1037,6 +1482,171 @@ export interface ContentItemWithAssetPath extends ContentItem {
 	 */
 	assetPath: string;
 };
+
+// API Interfaces
+
+interface ApiAct {
+	name: string;
+	/**
+	 * This field is excluded from the response when a locale is set
+	 */
+	localizedNames: LocalizedNames;
+	id: string;
+	isActive: boolean;
+}
+
+interface ApiRoundResult {
+	roundNum: number;
+	roundResult: string;
+	roundCeremony: string;
+	winningTeam: string;
+	/**
+	 * PUUID of player
+	 */
+	bombPlanter: Puuid;
+	/**
+	 * PUUID of player
+	 */
+	bombDefuser: Puuid;
+	plantRoundTime: number;
+	plantPlayerLocations: ApiPlayerLocations[];
+	plantLocation: Location;
+	plantSite: string;
+	defuseRoundTime: number;
+	defusePlayerLocations: ApiPlayerLocations[];
+	playerStats: ApiPlayerRoundStats[];
+	roundResultCode: string;
+}
+
+interface ApiPlayerRoundStats {
+	puuid: Puuid;
+	kills: ApiKill[];
+	damage: ApiDamage[];
+	score: number;
+	economy: Economy;
+	ability: Ability;
+}
+
+interface ApiDamage {
+	/**
+	 * PUUID
+	 */
+	receiver: Puuid;
+	damage: number;
+	legshots: number;
+	bodyshots: number;
+	headshots: number;
+}
+
+interface ApiKill {
+	timeSinceGameStartMillis: number;
+	timeSinceRoundStartMillis: number;
+	/**
+	 * PUUID
+	 */
+	killer: Puuid;
+	/**
+	 * PUUID
+	 */
+	victim: Puuid;
+	victimLocation: Location;
+	/**
+	 * List of PUUIDs
+	 */
+	assistants: Puuid[];
+	playerLocations: ApiPlayerLocations[];
+	finishingDamage: FinishingDamage;
+}
+
+interface ApiPlayerLocations {
+	puuid: Puuid;
+	viewRadians: number;
+	location: Location;
+}
+
+interface ApiCoach {
+	puuid: Puuid;
+	teamId: string;
+}
+
+interface ApiMatchPlayer {
+	puuid: Puuid;
+	gameName: string;
+	tagLine: string;
+	teamId: string;
+	partyId: string;
+	characterId: string;
+	stats: PlayerStats;
+	competitiveTier: number;
+	playerCard: string;
+	playerTitle: string;
+}
+
+interface ApiMatchListEntry {
+	matchId: string;
+	gameStartTimeMillis: number;
+	queueId: string;
+}
+
+interface ApiPlayer {
+	/**
+	 * This field may be omitted if the player has been anonymized.
+	 */
+	puuid: Puuid;
+	/**
+	 * This field may be omitted if the player has been anonymized.
+	 */
+	gameName: string;
+	/**
+	 * This field may be omitted if the player has been anonymized.
+	 */
+	tagLine: string;
+	leaderboardRank: number;
+	rankedRating: number;
+	numberOfWins: number;
+}
+
+interface ApiAnonymousPlayer {
+	leaderboardRank: number;
+	rankedRating: number;
+	numberOfWins: number;
+}
+
+interface ApiTeam {
+	/**
+	 * This is an arbitrary string. Red and Blue in bomb modes. The puuid of the player in deathmatch.
+	 */
+	teamId: "Red" | "Blue" | Puuid;
+	won: boolean;
+	roundsPlayed: number;
+	roundsWon: number;
+	/**
+	 * Team points scored. Number of kills in deathmatch.
+	 */
+	numPoints: number;
+}
+
+interface ApiStatus {
+	id: number;
+	maintenance_status: MaintenanceStatus;
+	incident_severity: IncidentSeverities;
+	titles: StatusContent[];
+	updates: ApiUpdate[];
+	created_at: string;
+	archive_at: string;
+	updated_at: string;
+	platforms: Platforms;
+}
+
+interface ApiUpdate {
+	id: number;
+	author: string;
+	publish: boolean;
+	publish_locations: PublishLocations[];
+	translations: StatusContent[];
+	created_at: string;
+	updated_at: string;
+}
 
 // Enums
 

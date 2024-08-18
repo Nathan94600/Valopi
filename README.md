@@ -18,7 +18,7 @@ npm install valopi
 Get informations about the status of a region :
 
 ```ts
-import Valopi from ".";
+import Valopi from "valopi";
 
 const valopi = new Valopi("Your RIOT_TOKEN")
 
@@ -35,16 +35,16 @@ valopi.getStatus("EU").then(platformData => {
 Get match ids of recent matches on console :
 
 ```ts
-import Valopi, { ConsoleQueues } from ".";
+import Valopi, { ConsoleQueues } from "valopi";
 
 const valopi = new Valopi("Your RIOT_TOKEN");
 
-valopi.getConsoleRecentMatches(ConsoleQueues.Unrated, "EU").then(recentMatches => {
+valopi.getRecentMatches(ConsoleQueues.Unrated, "EU (Console)").then(recentMatches => {
   if (typeof recentMatches == "string") console.log(`Recent matches: ${recentMatches}`);
   else {
     console.log("Match ids :");
 
-    recentMatches.matchIds.forEach(matchId => console.log(`- ${matchId}`));
+    recentMatches.matches.forEach(match => console.log(`- ${match.matchId}`));
   };
 });
 ```
@@ -52,16 +52,16 @@ valopi.getConsoleRecentMatches(ConsoleQueues.Unrated, "EU").then(recentMatches =
 Get player names from leaderboard :
 
 ```ts
-import Valopi from ".";
+import Valopi from "valopi";
 
 const valopi = new Valopi("Your RIOT_TOKEN");
 
-valopi.getLeaderboard("ACT_ID", { size: 100 }, "EU").then(leaderboard => {
+valopi.getLeaderboard("ACT_ID", "EU", { size: 100 }).then(leaderboard => {
   if (typeof leaderboard == "string") console.log(`Leaderboard: ${leaderboard}`);
   else {
     console.log("Player names :");
 
-    leaderboard.players.forEach(player => console.log(`- ${player.gameName || "Anonymous"}`));
+    leaderboard.players.forEach(player => console.log(`- ${"gameName" in player ? player.gameName : "Anonymous"}`));
   };
 });
 ```

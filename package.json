@@ -21,6 +21,10 @@
     "type": "git",
     "url": "git+https://github.com/Nathan94600/Valopi.git"
   },
+  "bugs": {
+    "url": "https://github.com/Nathan94600/Valopi/issues"
+  },
+  "homepage": "https://github.com/Nathan94600/Valopi#readme",
   "author": "Nathan94600",
   "license": "MIT",
   "description": "Valopi is a Node.js module for interacting with Valorant API.",

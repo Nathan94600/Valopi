@@ -1692,11 +1692,12 @@ export enum Queues {
 	Onefa = "onefa",
 	Ggteam = "ggteam",
 	Hurm = "hurm",
+	Swiftplay = "swiftplay",
 }
 
 export enum ConsoleQueues {
 	Unrated = "console_unrated",
 	Deathmatch = "console_deathmatch",
-	Ggteam = "console_swiftplay",
+	Swiftplay = "console_swiftplay",
 	Hurm = "console_hurm",
 }
